@@ -9,13 +9,14 @@
 ## 目錄
 
 - [技術風險提示：本地端 AI Agent 誤刪案例分析](#技術風險提示本地端-ai-agent-誤刪案例分析)
+- [防範架構設計：為什麼不在 Prompt 裡寫「禁止指令」？（防粉紅大象效應）](#防範架構設計為什麼不在-prompt-裡寫禁止指令防粉紅大象效應)
 - [建議部署之安全防護措施](#建議部署之安全防護措施)
 - [Windows 防護配置（通用版）](#windows-防護配置通用版)
-  - [1. AGENTS.md / MEMORY.md 記憶規範 (Windows)](#1-agentsmd--memorymd-記憶規範-windows)
-  - [2. SKILL.md 安全清理技能 (Windows)](#2-skillmd-安全清理技能-windows)
+  - [1. AGENTS.md / MEMORY.md 正向記憶規範 (Windows)](#1-agentsmd--memorymd-正向記憶規範-windows)
+  - [2. SKILL.md 安全清理技能與底層攔截器 (Windows)](#2-skillmd-安全清理技能與底層攔截器-windows)
 - [macOS 防護配置（通用版）](#macos-防護配置通用版)
-  - [1. AGENTS.md / MEMORY.md 記憶規範 (macOS)](#1-agentsmd--memorymd-記憶規範-macos)
-  - [2. SKILL.md 安全清理技能 (macOS)](#2-skillmd-安全清理技能-macos)
+  - [1. AGENTS.md / MEMORY.md 正向記憶規範 (macOS)](#1-agentsmd--memorymd-正向記憶規範-macos)
+  - [2. SKILL.md 安全清理技能與底層攔截器 (macOS)](#2-skillmd-安全清理技能與底層攔截器-macos)
 
 ---
 
@@ -39,46 +40,58 @@ Agent 工具預設寫入的無 BOM UTF-8 `.ps1` 腳本，在透過舊版 Windows
 
 ---
 
+## 防範架構設計：為什麼不在 Prompt 裡寫「禁止指令」？（防粉紅大象效應）
+
+在設計 AI Agent 的安全規則時，若在常駐的系統提示詞（`AGENTS.md` / `MEMORY.md`）中寫入大量負向禁令（例如：`NEVER use Remove-Item -Force`、`NEVER delete Desktop`），在 Transformer 的自注意力機制（Self-Attention）下反而會引發**「負向約束失效（Negative Constraint Failure / 粉紅大象效應）」**：
+
+1. **詞元誘導（Token Priming）：** 只要危險指令或敏感路徑名稱出現在 System Prompt 中，這些詞元就會進入 KV Cache 並處於高活躍狀態。當對話輪次拉長、模型對否定詞（`NEVER` / `NOT`）的注意力權重被稀釋時，模型反而更容易直接複製並輸出這些危險指令與路徑。
+2. **大腦與手腳職責分離（本專案解決方案）：**
+   - **在 `AGENTS.md`（給 LLM 看的常駐記憶）：** 採用**「100% 純正向行為錨定（Positive-Only Framing）」**。完全不提及任何危險刪除指令與敏感目錄名稱，而是規定唯一允許呼叫的安全封裝函式（`Move-ToRecycleBin` / `move_to_trash`）與結構化路徑檢查表。
+   - **在 `SKILL.md`（給作業系統跑的底層腳本）：** 將具體的系統目錄黑名單（`Desktop`、`Downloads`、`Program Files` 等）封裝在 PowerShell / Bash 的 `Assert-SafePath` 攔截函式中。由作業系統執行 100% 確定性的路徑比對，一旦命中保護目錄即刻拋出例外中斷執行，徹底杜絕模型幻覺。
+
+---
+
 ## 建議部署之安全防護措施
 
-為避免類似情況發生，建議在 AI Agent 的系統提示詞（`AGENTS.md` / `MEMORY.md`）與技能範本（`SKILL.md`）中導入以下四項防護規範：
-
-1. **以完整路徑取代編號授權：** 進行檔案刪除或搬移前，避免僅使用數字代號確認；應要求 Agent 在當前回合重新列出目標的完整絕對路徑，確認無誤後才允許執行。
-2. **禁用永久刪除指令，強制改用系統回收筒 API：** 明文禁止模型使用 `Remove-Item -Force`、`Clear-RecycleBin`（Windows）及 `rm -rf`（macOS/Linux）。所有刪除操作應統一透過系統 API 移至資源回收筒（如 Windows 的 `SendToRecycleBin` 或 macOS 的 `/usr/bin/trash`），保留還原空間。
-3. **建立核心目錄保護清單：** 在腳本範本中實作路徑檢查機制，將使用者根目錄、`Desktop`、`Downloads`、`Documents`、`AppData`、`Program Files` 等關鍵系統與使用者目錄設為保護名單，一旦解析出的目標路徑為上述根目錄本身，即刻觸發例外並中斷腳本。
-4. **強化編碼相容性與空變數驗證：** 在腳本中強制檢驗路徑變數不得為空值，並統一使用 `-LiteralPath` 取代 `-Path`，防止因中文編碼解析失敗或萬用字元展開而波及母目錄。
+1. **以完整路徑映射表取代編號授權：** 進行檔案刪除或搬移前，避免僅使用數字代號確認；要求 Agent 在當前回合輸出 `編號 -> 完整絕對路徑` 對照表，確認無誤後才允許執行。
+2. **單一安全回收筒 API 通道：** 規範所有刪除操作僅能透過封裝好的系統回收筒函式（Windows 的 `SendToRecycleBin` 或 macOS 的 `/usr/bin/trash`）執行，保留完整還原空間。
+3. **底層腳本核心目錄攔截：** 在 `SKILL.md` 腳本範本中實作動態路徑攔截機制，自動鎖死當前電腦的所有磁碟根目錄與使用者核心目錄。
+4. **強化編碼相容性與空變數斷言：** 在腳本中強制檢驗路徑變數不得為空值，並統一使用 `-LiteralPath`（Windows）與 `set -euo pipefail`（macOS），防止因中文編碼解析失敗或萬用字元展開而波及母目錄。
 
 ---
 
 ## Windows 防護配置（通用版）
 
-以下為適用於所有 Windows 機台之動態防護設定，會自動解析當前使用者路徑與所有掛載磁碟。
+以下設定採用「正向提示詞 + 底層腳本攔截」雙層架構，適用於所有 Windows 機台。
 
-### 1. `AGENTS.md` / `MEMORY.md` 記憶規範 (Windows)
+### 1. `AGENTS.md` / `MEMORY.md` 正向記憶規範 (Windows)
 
-可直接複製以下區塊內容，貼入專案根目錄的 `AGENTS.md`、`MEMORY.md`，或設定檔中的 `system_prompt`：
+可直接複製以下區塊內容，貼入專案根目錄的 `AGENTS.md`、`MEMORY.md`，或設定檔中的 `system_prompt`（此區塊已採用零負向誘導設計，不出現任何危險指令字眼）：
 
 ````markdown
-# CRITICAL FILE SYSTEM SAFETY RULES (CROSS-PLATFORM WINDOWS POWERSHELL)
+# FILE SYSTEM EXECUTION PROTOCOL (WINDOWS POWERSHELL)
 
-You are running on a Windows workstation. Any file deletion mistake causes irreversible data loss. You MUST obey these rules without exception across any machine or user profile:
+When performing file cleanup, deletion, or directory movement on Windows, you MUST strictly follow this positive execution protocol across every turn and batch:
 
-## 1. BANNED COMMANDS (ZERO TOLERANCE)
-- **NEVER** use `Remove-Item -Force` or `Remove-Item -Recurse -Force` on directories.
-- **NEVER** use `Clear-RecycleBin`, `del /f /s /q`, `rd /s /q`, or raw command-line directory deletion.
-- **ALL** file and directory deletions MUST be sent to the Windows Recycle Bin using `Microsoft.VisualBasic.FileIO.FileSystem` (`SendToRecycleBin`). Permanent deletion is strictly forbidden.
+## 1. EXCLUSIVE SAFE REMOVAL API
+- Perform all file and directory removals EXCLUSIVELY by calling the `Move-ToRecycleBin` wrapper function backed by `Microsoft.VisualBasic.FileIO.FileSystem` (`SendToRecycleBin`).
+- Perform all directory movements EXCLUSIVELY by calling the `Move-ItemSafely` wrapper function.
+- Clean package manager or tool caches EXCLUSIVELY using their native built-in cache subcommands (such as `uv cache clean`).
+- Keep all system runtime directories and application installations intact; limit installer cleanup strictly to standalone `.exe` or `.msi` files inside temporary download folders.
 
-## 2. UNIVERSAL DYNAMIC PATH BLACKLIST (NEVER DELETE OR MOVE ROOT PATHS)
-Regardless of the current username or drive letter, you MUST NEVER target any of the following paths for deletion or root movement:
-- Current user profile: `$env:USERPROFILE`
-- Standard user shell folders: Desktop, Downloads, Documents, Pictures, Videos, Music under `$env:USERPROFILE` - Application data roots: `$env:APPDATA` (`AppData\Roaming`), `$env:LOCALAPPDATA` (`AppData\Local`) - Package manager root folders: `$env:LOCALAPPDATA\uv` (Use `uv cache clean` ONLY; NEVER delete the `uv` parent directory)
-- Operating system & Program roots: Any drive root (e.g., `C:\`, `D:\`), `$env:SystemRoot` (`C:\Windows`), `$env:ProgramFiles`, `$env:ProgramFiles(x86)`, `$env:ProgramData` - Active workspace roots: The root directory where your agent or project is hosted.  ## 3. ZERO NUMBER-ONLY DISPATCH & CROSS-TURN AMNESIA SHIELD - When the user approves cleanup tasks using numbers (e.g., "Delete 1, 3, 5; move 2"), **NEVER** guess or retrieve paths from long conversational memory. - Before executing ANY deletion or move, you MUST re-list the exact absolute path (`C:\...`) for each item in the current turn. If you are even 1\% uncertain about which path an index corresponds to, **STOP and ask for explicit confirmation**.  ## 4. POWERSHELL ENCODING & NULL-VARIABLE COLLAPSE DEFENSE - Windows PowerShell 5.1 (`powershell.exe`) defaults to non-UTF8 (ANSI/Big5) for `.ps1` scripts without BOM. Non-ASCII/CJK characters (such as Chinese directory names) will corrupt into empty strings or garbage, causing `"$dir\$subfolder"` to collapse to `"$dir\"` and wipe the entire parent directory (e.g., Desktop/Downloads)! - **RULE:** Always use `-LiteralPath` instead of `-Path` (to prevent accidental wildcard expansion). - **RULE:** Always validate `[string]::IsNullOrWhiteSpace($targetPath)` and ensure the resolved path does NOT equal any parent directory before issuing file system commands.
+## 2. MANDATORY LITERAL PATH MAPPING TABLE
+- Whenever the user selects items by index numbers (e.g., "1, 3, 6"), you MUST first output an explicit `Index -> Full Literal Path` table in the current turn before generating or running any script.
+- Verify that every resolved path points to a specific, intended leaf target (a specific child subfolder or individual file).
+- If any item index or path mapping is ambiguous, pause immediately and ask the user to confirm the exact literal path.
 
-## 5. THINKING-STAGE BUG ABORT PROTOCOL
-- If during your internal reasoning/thinking process you spot ANY flaw, scope over-extension, or accidental system directory deletion (e.g., "Wait, this deletes the parent folder too"), you MUST **ABORT EXECUTION IMMEDIATELY** and fix the script. NEVER proceed with "it should be fine" or "safe to execute anyway".
+## 3. DEFENSIVE POWERSHELL SCRIPT STANDARDS
+- Start every file-operation `.ps1` script with `$ErrorActionPreference = 'Stop'` and load the safe wrapper functions from the `safe-disk-cleanup` skill. - Always pass `-LiteralPath` to file system cmdlets to ensure exact string matching without wildcard expansion. - Before executing any operation on a path variable, assert that the variable is non-empty (`-not [string]::IsNullOrWhiteSpace($target)`) and passes `Assert-SafePath`.
+
+## 4. IMMEDIATE HALT ON REASONING ANOMALIES
+- If during your reasoning process you detect any script bug, path discrepancy, encoding issue, or scope mismatch, halt execution immediately, rewrite the script to fix the flaw, and re-verify all target paths before running.
 ````
 
-### 2. `SKILL.md` 安全清理技能 (Windows)
+### 2. `SKILL.md` 安全清理技能與底層攔截器 (Windows)
 
 請在 Agent 的 `skills` 目錄下建立 `safe-disk-cleanup/SKILL.md`，並貼入以下內容：
 
@@ -90,18 +103,18 @@ description: Universal Windows file operation skill with dynamic environment det
 
 # Universal Windows Safe Disk Operations Skill
 
-When executing cleanup, file deletion, or directory moves on any Windows machine, you MUST adhere to the dynamic path resolution rules and utilize the provided PowerShell template below.
+When executing cleanup, file deletion, or directory moves on any Windows machine, you MUST utilize the provided PowerShell template below.
 
 ## Operational Directives
 
-1. **Dynamic Environment Binding:** Never hardcode specific usernames (e.g., `C:\Users\John`) or static drives. Always resolve paths dynamically using environment variables (`$env:USERPROFILE`, `$env:LOCALAPPDATA`, etc.).
-2. **Runtime Preservation:** Distinguish standalone installer packages (`.exe`/`.msi` inside Downloads or Temp) from installed system runtimes inside `Program Files` or package manager cores. Never delete installed runtimes.
-3. **Encoding Safety:** Use literal paths and guard against string truncation when handling folders containing CJK/Unicode characters.
-4. **Mandatory Recycle Bin:** Always use Windows Shell API to send files to the Recycle Bin so accidental deletions can be restored.
+1. **Dynamic Environment Binding:** Resolve paths dynamically using environment variables (`$env:USERPROFILE`, `$env:LOCALAPPDATA`, etc.).
+2. **Runtime Preservation:** Only remove standalone installer files (`.exe`/`.msi`) when cleaning downloads. Preserve all installed system runtimes and package manager root directories.
+3. **Encoding Safety:** Always use `-LiteralPath` and validate path resolution via `Assert-SafePath` before acting on folders containing CJK/Unicode characters.
+4. **Mandatory Recycle Bin:** Always use `Move-ToRecycleBin` so all removed items can be restored from the Windows Recycle Bin.
 
 ## Universal PowerShell Execution Template
 
-When writing `.ps1` scripts for file maintenance, ALWAYS wrap your logic with this defensive header:
+When writing `.ps1` scripts for file maintenance, ALWAYS include this defensive header:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -200,65 +213,56 @@ function Move-ItemSafely {
 
 ## macOS 防護配置（通用版）
 
-以下為適用於所有 macOS（Apple Silicon / Intel）之動態防護設定，支援 macOS 原生垃圾桶（Trash）與外接卷宗根目錄保護。
+以下為適用於所有 macOS（Apple Silicon / Intel）之正向記憶規範與底層攔截腳本，支援 macOS 原生垃圾桶（Trash）與外接卷宗保護。
 
-### 1. `AGENTS.md` / `MEMORY.md` 記憶規範 (macOS)
+### 1. `AGENTS.md` / `MEMORY.md` 正向記憶規範 (macOS)
 
 可直接貼入任何 Mac 上的 `MEMORY.md`、工作目錄的 `AGENTS.md` 或 `system_prompt`：
 
 ````markdown
-# CRITICAL FILE SYSTEM SAFETY RULES (UNIVERSAL macOS / ZSH / BASH)
+# FILE SYSTEM EXECUTION PROTOCOL (macOS ZSH / BASH)
 
-You are running on a macOS workstation. Any file deletion mistake on APFS/SSD causes immediate TRIM and irreversible data loss. You MUST obey these rules without exception across any Mac or user account:
+When performing file cleanup, deletion, or directory movement on macOS, you MUST strictly follow this positive execution protocol across every turn and batch:
 
-## 1. BANNED COMMANDS (ZERO TOLERANCE)
-- **NEVER** use `rm -rf`, `rm -fr`, `rm -r`, `unlink`, or `find ... -delete`.
-- **NEVER** empty the macOS Trash (`rm -rf ~/.Trash/*` or via AppleScript `empty trash`).
-- **ALL** file and directory deletions MUST be sent to the macOS Trash using the native `/usr/bin/trash` command or Finder AppleScript (`osascript`), NEVER permanently deleted.
+## 1. EXCLUSIVE SAFE REMOVAL API
+- Perform all file and directory removals EXCLUSIVELY by calling the `move_to_trash` wrapper function (which routes items to the macOS Trash via `/usr/bin/trash` or Finder AppleScript).
+- Perform all directory movements EXCLUSIVELY by calling the `move_item_safely` wrapper function.
+- Clean package manager or developer caches EXCLUSIVELY using their native built-in subcommands (such as `uv cache clean` or `brew cleanup`).
+- Keep all application bundles (`.app`) and toolchain root directories intact unless explicitly requested by exact full path.
 
-## 2. UNIVERSAL DYNAMIC PATH BLACKLIST (NEVER DELETE OR MOVE ROOT PATHS)
-Regardless of the current macOS username or mounted volume, you MUST NEVER target any of the following paths for deletion or root movement:
-- Current user home: `$HOME` (`/Users/$USER`)
-- Standard user folders: `$HOME/Desktop`, `$HOME/Downloads`, `$HOME/Documents`, `$HOME/Pictures`, `$HOME/Movies`, `$HOME/Music`, `$HOME/Public`
-- macOS Library & App Data roots: `$HOME/Library`, `$HOME/Library/Application Support`, `$HOME/Library/Preferences`, `$HOME/Library/Caches` (NEVER delete `Caches` as a whole)
-- Developer & Toolchain roots: `/opt/homebrew`, `/usr/local`, `$HOME/.local`, `$HOME/.cache`, `$HOME/.cargo`, `$HOME/.pyenv`, `$HOME/.nvm` (For `uv`, run `uv cache clean` ONLY; NEVER delete the `uv` directory or environment root)
-- System & Volume roots: `/`, `/System`, `/Applications`, `/Library`, `/Users`, `/Volumes`, `/private`, `/var`, `/etc`, `/tmp`
-- Active workspace root: The root directory where the agent or current project is located.
+## 2. MANDATORY LITERAL PATH MAPPING TABLE
+- Whenever the user selects items by index numbers (e.g., "1, 3, 6"), you MUST first output an explicit `Index -> Full POSIX Path` table in the current turn before generating or running any script.
+- Verify that every resolved path points to a specific, intended leaf target (a specific child subfolder or individual file).
+- If any item index or path mapping is ambiguous, pause immediately and ask the user to confirm the exact path.
 
-## 3. ZERO NUMBER-ONLY DISPATCH & CROSS-TURN AMNESIA SHIELD
-- When the user approves cleanup tasks using numbers (e.g., "Delete 1, 3, 5; move 2"), **NEVER** guess or retrieve paths from conversational memory.
-- Before executing ANY deletion or move, you MUST re-list the exact absolute POSIX path (`/Users/...`) for each item in the current turn. If you are even 1% uncertain which path an index corresponds to, **STOP and ask the user**.
+## 3. DEFENSIVE SHELL SCRIPT STANDARDS
+- Start every `.sh` or `.zsh` file-operation script with `set -euo pipefail` and include the safe wrapper functions from the `safe-disk-cleanup` skill.
+- Always enforce non-empty parameter expansion (`${TARGET:?Error: Variable is empty}`) and canonical path resolution via `realpath` within `assert_safe_path` to prevent empty-variable directory collapse and handle APFS Unicode NFD/NFC filenames safely.
 
-## 4. SHELL UNSET-VARIABLE COLLAPSE & NFD/NFC UNICODE DEFENSE
-- In `zsh`/`bash`, if a subfolder variable `$SUBDIR` is empty, unset, or fails to match due to macOS APFS Unicode NFD/NFC normalization (common with Chinese/Japanese/accented folder names), `"$HOME/Desktop/$SUBDIR"` collapses into `"$HOME/Desktop/"` and wipes the entire Desktop!
-- **RULE:** Always put `set -euo pipefail` at the top of every shell script.
-- **RULE:** Always use `${VAR:?Error: Variable is empty}` parameter expansion so an empty variable immediately aborts the script.
-- **RULE:** Always resolve canonical paths with `realpath` and verify the target is NOT equal to `$HOME/Desktop` or any parent directory before acting.
-
-## 5. THINKING-STAGE BUG ABORT PROTOCOL
-- If during your internal reasoning/thinking process you spot ANY bug, unintended directory scope, or path mismatch in a script you wrote (e.g., "Wait a sec — there's a bug in the script"), you MUST **ABORT EXECUTION IMMEDIATELY** and fix the script. NEVER rationalize a bug with "OK, safe. Execute".
+## 4. IMMEDIATE HALT ON REASONING ANOMALIES
+- If during your reasoning process you detect any script bug, path discrepancy, Unicode normalization mismatch, or scope error, halt execution immediately, rewrite the script to fix the flaw, and re-verify all target paths before running.
 ````
 
-### 2. `SKILL.md` 安全清理技能 (macOS)
+### 2. `SKILL.md` 安全清理技能與底層攔截器 (macOS)
 
 請在 Mac 的 Agent `skills` 目錄下建立 `safe-disk-cleanup/SKILL.md`，並貼入以下內容：
 
 ````markdown
 ---
 name: safe-disk-cleanup
-description: Universal macOS file operation skill with dynamic environment detection. Enforces macOS Trash safety, blocks rm -rf, protects all macOS System/User/Homebrew root paths, and prevents empty-variable collapse.
+description: Universal macOS file operation skill with dynamic environment detection. Enforces macOS Trash safety, protects all macOS System/User/Homebrew root paths, and prevents empty-variable collapse.
 ---
 
 # Universal macOS Safe Disk Operations Skill
 
-When executing disk cleanup, file deletion, or directory moves on any Mac, you MUST follow these rules and use the defensive `bash`/`zsh` template below.
+When executing disk cleanup, file deletion, or directory moves on any Mac, you MUST use the defensive `bash`/`zsh` template below.
 
 ## Operational Directives
 
-1. **Dynamic Environment Binding:** Never hardcode specific usernames (e.g., `/Users/john`). Always use `$HOME` and resolve symlinks dynamically via `realpath`.
-2. **Toolchain & App Bundle Preservation:** Never delete `.app` bundles inside `/Applications` or `~/Applications` unless explicitly requested by exact app name. Never delete `/opt/homebrew` or toolchain roots (`uv`, `conda`, `nvm`). For package managers, use their built-in cache clean commands (`uv cache clean`, `brew cleanup`).
-3. **Unicode NFD/NFC Safety:** macOS APFS stores filenames in Unicode NFD (or normalization-insensitive) form. Never rely on unverified string concatenation for CJK/Chinese folder names; always verify path existence with `[[ -e "$target" ]]` before acting.
-4. **Mandatory macOS Trash:** Never use `rm -rf`. Always use the `move_to_trash` function below so items go to the macOS Trash.
+1. **Dynamic Environment Binding:** Always use `$HOME` and resolve symlinks dynamically via `realpath`.
+2. **Toolchain & App Bundle Preservation:** Preserve `.app` bundles and toolchain roots (`uv`, `homebrew`, `conda`, `nvm`). Use built-in cache clean commands (`uv cache clean`, `brew cleanup`).
+3. **Unicode NFD/NFC Safety:** Always verify path existence with `[[ -e "$target" ]]` inside `assert_safe_path` before acting on CJK/Unicode folder names.
+4. **Mandatory macOS Trash:** Always use the `move_to_trash` function below so items are safely placed in the macOS Trash.
 
 ## Universal macOS Shell Execution Template
 
